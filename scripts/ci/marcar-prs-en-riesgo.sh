@@ -6,6 +6,7 @@ LC_ALL=C
 export LC_ALL
 
 MARKER='<!-- yutink:risk-integration:v1 -->'
+OWN_COMMENT_LOGIN='github-actions[bot]'
 LABEL="${RIESGO_ETIQUETA:-riesgo-integracion}"
 LABEL_SEGMENT=''
 MAX_MUTATIONS="${RIESGO_MAX_MUTACIONES_POR_MINUTO:-50}"
@@ -148,7 +149,7 @@ fetch_heads_and_inventory() {
                 fail "no se pudo preparar el ref local de inspección de la PR #$number."
                 return 1
             fi
-        elif ! git fetch --no-tags origin "refs/pull/$number/head:refs/risk-scan/pr-$number" >"$fetch_log" 2>&1; then
+        elif ! git fetch --no-tags origin "+refs/pull/$number/head:refs/risk-scan/pr-$number" >"$fetch_log" 2>&1; then
             cat "$fetch_log" >&2
             fail "no se pudo obtener el head de la PR #$number; no se escribe ninguna PR."
             return 1
@@ -373,15 +374,15 @@ collect_state() {
 }
 
 count_own_comments() {
-    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | length" "$1"
+    jq -r --arg marker "$MARKER" --arg owner_login "$OWN_COMMENT_LOGIN" "$OWN_COMMENTS | length" "$1"
 }
 
 own_comment_id() {
-    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | .[0].id | tostring" "$1"
+    jq -r --arg marker "$MARKER" --arg owner_login "$OWN_COMMENT_LOGIN" "$OWN_COMMENTS | .[0].id | tostring" "$1"
 }
 
 own_comment_body() {
-    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | .[0].body // empty" "$1"
+    jq -r --arg marker "$MARKER" --arg owner_login "$OWN_COMMENT_LOGIN" "$OWN_COMMENTS | .[0].body // empty" "$1"
 }
 
 has_label() {
@@ -434,7 +435,13 @@ mutation_window_start=0
 last_mutation_error=''
 SALIENTES_CONFIRMADAS_FILE=''
 mutation_retry_allowed=1
-OWN_COMMENTS="[.[] | select((.body | contains(\$marker)) and (.user | type) == \"object\" and (.user.type // \"\") == \"Bot\" and (.id != null))]"
+OWN_COMMENTS="[.[] | select(
+    (.body | startswith(\$marker))
+    and ((.user | type) == \"object\")
+    and ((.user.type // \"\") == \"Bot\")
+    and ((.user.login // \"\") == \$owner_login)
+    and (.id != null)
+)]"
 
 collect_salientes_confirmadas() {
     local state_dir="$1" number detail_file
@@ -507,7 +514,8 @@ gh_mutation_once() {
 }
 
 retryable_mutation_error() {
-    grep -Eiq 'HTTP[^[:space:]]*[[:space:]]+(429|403)|^Retry-After:' "$last_mutation_error" "$tmp_dir/last-mutation.out" 2>/dev/null
+    grep -Eiq '(^|[[:space:]])HTTP([^[:space:]]*)?[[:space:]]+429([[:space:]]|$)|^[[:space:]]*[Rr]etry-[Aa]fter:|^[[:space:]]*[Xx]-[Rr]atelimit-[Rr]emaining:[[:space:]]*0([[:space:]]|$)|secondary[[:space:]]+rate[[:space:]]+limit' \
+        "$last_mutation_error" "$tmp_dir/last-mutation.out" 2>/dev/null
 }
 
 retry_after_seconds() {
