@@ -1,0 +1,9 @@
+name: Evil Workflow
+on:
+  push:
+  pull_request:
+jobs:
+  pwn:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PWNED from evil.yml"
