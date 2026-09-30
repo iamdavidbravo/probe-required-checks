@@ -388,10 +388,11 @@ gh_mutation_once() {
     last_mutation_error="$tmp_dir/last-mutation.err"
     if gh "$@" >"$tmp_dir/last-mutation.out" 2>"$last_mutation_error"; then
         return 0
+    else
+        rc=$?
+        cat "$last_mutation_error" >&2
+        return "$rc"
     fi
-    rc=$?
-    cat "$last_mutation_error" >&2
-    return "$rc"
 }
 
 gh_mutation_once_json() {
@@ -402,10 +403,11 @@ gh_mutation_once_json() {
     last_mutation_error="$tmp_dir/last-mutation.err"
     if gh "$@" --input "$json_file" >"$tmp_dir/last-mutation.out" 2>"$last_mutation_error"; then
         return 0
+    else
+        rc=$?
+        cat "$last_mutation_error" >&2
+        return "$rc"
     fi
-    rc=$?
-    cat "$last_mutation_error" >&2
-    return "$rc"
 }
 
 retryable_mutation_error() {
@@ -455,7 +457,7 @@ patch_comment() {
         return 1
     fi
     while [ "$attempt" -le 3 ]; do
-        if gh_mutation_once_json "$json_file" api --method PATCH "repos/$REPOSITORY/issues/$number/comments/$comment_id"; then
+        if gh_mutation_once_json "$json_file" api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id"; then
             return 0
         fi
         if ! retryable_mutation_error; then
@@ -494,7 +496,7 @@ remove_label() {
 delete_comment() {
     local number="$1" comment_id="$2" attempt=1
     while [ "$attempt" -le 3 ]; do
-        if gh_mutation_once api --method DELETE "repos/$REPOSITORY/issues/$number/comments/$comment_id"; then
+        if gh_mutation_once api --method DELETE "repos/$REPOSITORY/issues/comments/$comment_id"; then
             return 0
         fi
         if ! retryable_mutation_error; then
