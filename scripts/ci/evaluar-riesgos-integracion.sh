@@ -39,16 +39,8 @@ done
 [ -n "$inventory" ] || { usage; fail 'debes indicar --inventario'; }
 [ -f "$inventory" ] || fail "el inventario no existe: $inventory"
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-if [ -z "$repo_root" ] || ! git -C "$repo_root" rev-parse --verify --quiet "$main_sha^{commit}" >/dev/null; then
-    fixture_repo="$(dirname "$inventory")/repo"
-    if [ -d "$fixture_repo/.git" ] && git -C "$fixture_repo" rev-parse --verify --quiet "$main_sha^{commit}" >/dev/null; then
-        repo_root=$(git -C "$fixture_repo" rev-parse --show-toplevel)
-    else
-        [ -n "$repo_root" ] || fail 'el cwd debe estar dentro de un repositorio Git'
-        fail "main-sha no resuelve a un commit: $main_sha"
-    fi
-fi
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || fail 'el cwd debe estar dentro de un repositorio Git'
+git -C "$repo_root" rev-parse --verify --quiet "$main_sha^{commit}" >/dev/null || fail "main-sha no resuelve a un commit: $main_sha"
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/evaluar-riesgos-integracion.XXXXXX")
 cleanup() {
@@ -66,9 +58,6 @@ while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
         *$'\r'*|*$'\n'*) fail 'el inventario contiene un control de línea inválido' ;;
     esac
-    if [[ "$line" != *$'\t'* && "$line" == *'\t'* ]]; then
-        line=${line/'\t'/$'\t'}
-    fi
     case "$line" in
         *$'\t'*) ;;
         *) fail 'cada fila del inventario debe tener número y SHA separados por tabulador' ;;
@@ -100,7 +89,7 @@ normalize_version() {
     while [ "${#version}" -gt 1 ] && [ "${version#0}" != "$version" ]; do
         version=${version#0}
     done
-    printf '%s' "$version"
+    printf '%s\n' "$version"
 }
 
 extract_versions() {
@@ -114,7 +103,6 @@ extract_versions() {
     while IFS= read -r -d '' path; do
         if [[ "$path" =~ (^|/)db/migration/V([0-9]+)__[^/]+[.]sql$ ]]; then
             normalize_version "${BASH_REMATCH[2]}" >> "$output"
-            printf '\n' >> "$output"
         fi
     done < "$tree_paths"
     if ! LC_ALL=C sort -u "$output" -o "$output"; then
@@ -152,13 +140,11 @@ blob_id() {
 main_versions="$tmp_dir/main-versions"
 extract_versions "$main_sha" "$main_versions"
 max_main_version=
-if [ -s "$main_versions" ]; then
-    while IFS= read -r version; do
-        if [ -z "$max_main_version" ] || decimal_less_or_equal "$max_main_version" "$version"; then
-            max_main_version=$version
-        fi
-    done < "$main_versions"
-fi
+while IFS= read -r version; do
+    if [ -z "$max_main_version" ] || decimal_less_or_equal "$max_main_version" "$version"; then
+        max_main_version=$version
+    fi
+done < "$main_versions"
 
 pr_dir="$tmp_dir/prs"
 mkdir -p "$pr_dir"
@@ -179,8 +165,6 @@ while IFS=$'\t' read -r number head_sha; do
     if ! comm -23 "$pr_path/head-versions" "$pr_path/base-versions" > "$pr_path/new-versions"; then
         fail "no se pudieron calcular las migraciones nuevas de la PR #$number"
     fi
-    : > "$pr_path/findings"
-
     while IFS= read -r version; do
         [ -n "$version" ] || continue
         if contains_line "$version" "$main_versions"; then
@@ -189,6 +173,15 @@ while IFS=$'\t' read -r number head_sha; do
             printf '%s\tFLYWAY_ORDEN_OBSOLETO\tV%s\n' "$number" "$version" >> "$results_raw"
         fi
     done < "$pr_path/new-versions"
+
+    for lockfile in package-lock.json yutink-frontend/package-lock.json; do
+        main_blob=$(blob_id "$main_sha" "$lockfile")
+        base_blob=$(blob_id "$merge_base" "$lockfile")
+        head_blob=$(blob_id "$head_sha" "$lockfile")
+        if [ "$main_blob" != "$base_blob" ] && [ "$head_blob" != "$base_blob" ] && [ "$main_blob" != "$head_blob" ]; then
+            printf '%s\tLOCKFILE_DIVERGENTE\t%s\n' "$number" "$lockfile" >> "$results_raw"
+        fi
+    done
 done < "$sorted_inventory"
 
 while IFS=$'\t' read -r first_number _first_sha; do
@@ -204,18 +197,6 @@ while IFS=$'\t' read -r first_number _first_sha; do
             printf '%s\tFLYWAY_COLISION_PR\tV%s con #%s\n' "$second_number" "$version" "$first_number" >> "$results_raw"
         done < "$common"
     done < "$sorted_inventory"
-done < "$sorted_inventory"
-
-while IFS=$'\t' read -r number head_sha; do
-    merge_base=$(cat "$tmp_dir/merge-bases-$number")
-    for lockfile in package-lock.json yutink-frontend/package-lock.json; do
-        main_blob=$(blob_id "$main_sha" "$lockfile")
-        base_blob=$(blob_id "$merge_base" "$lockfile")
-        head_blob=$(blob_id "$head_sha" "$lockfile")
-        if [ "$main_blob" != "$base_blob" ] && [ "$head_blob" != "$base_blob" ] && [ "$main_blob" != "$head_blob" ]; then
-            printf '%s\tLOCKFILE_DIVERGENTE\t%s\n' "$number" "$lockfile" >> "$results_raw"
-        fi
-    done
 done < "$sorted_inventory"
 
 if [ -s "$results_raw" ]; then

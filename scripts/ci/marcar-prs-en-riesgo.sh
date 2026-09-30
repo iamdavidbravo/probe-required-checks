@@ -71,14 +71,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+origin_main_sha() {
+    local remote_lines
+    remote_lines=$(git ls-remote --exit-code origin refs/heads/main 2>/dev/null) || return 1
+    remote_lines="${remote_lines%%$'\n'*}"
+    printf '%s' "${remote_lines%%$'\t'*}"
+}
+
 check_origin_main() {
-    local remote_lines remote_sha
-    if ! remote_lines=$(git ls-remote --exit-code origin refs/heads/main 2>/dev/null); then
+    local remote_sha
+    if ! remote_sha=$(origin_main_sha); then
         fail 'no se pudo leer refs/heads/main desde origin.'
         return 1
     fi
-    remote_lines="${remote_lines%%$'\n'*}"
-    remote_sha="${remote_lines%%$'\t'*}"
     if [ "$remote_sha" != "$MAIN_SHA" ]; then
         fail "origin/main ($remote_sha) no coincide con GITHUB_SHA ($MAIN_SHA)."
         return 1
@@ -169,7 +174,7 @@ run_evaluator() {
         fail 'la evaluación de riesgos no pudo completarse; se conserva el estado existente.'
         return 1
     fi
-    if [ -s "$findings_file" ] && ! awk -F '\t' 'NF == 3' "$findings_file" >/dev/null; then
+    if [ -s "$findings_file" ] && ! awk -F '\t' 'NF != 3 { exit 1 }' "$findings_file"; then
         fail 'el evaluador produjo una salida TSV inválida.'
         return 1
     fi
@@ -188,7 +193,6 @@ collect_snapshot_from_file() {
     local attempt_dir="$1" prs_file="$2" inventory_file findings_file count
     inventory_file="$attempt_dir/inventario.tsv"
     findings_file="$attempt_dir/hallazgos.tsv"
-    mkdir -p "$attempt_dir"
     check_origin_main || return 1
     fetch_heads_and_inventory "$prs_file" "$inventory_file" || return 1
     if ! count=$(jq 'length' "$prs_file"); then
@@ -206,6 +210,12 @@ collect_snapshot_from_file() {
     SNAPSHOT_COUNT="$count"
 }
 
+register_drift() {
+    REVALIDATION_PRS="$1"
+    SNAPSHOT_DRIFT=1
+    collect_salientes_confirmadas "$2"
+}
+
 normalize_prs() {
     local source_file="$1" target_file="$2"
     if ! jq -S 'map({number: (.number | floor), state, base: .base.ref, head: .head.sha}) | sort_by(.number)' "$source_file" >"$target_file"; then
@@ -214,33 +224,39 @@ normalize_prs() {
     fi
 }
 
-removed_pr_numbers() {
-    local previous_file="$1" current_file="$2" output_file="$3"
+accumulate_salientes_confirmadas_from_inventory() {
+    local previous_file="$1" current_file="$2" new_file
+    new_file="$SALIENTES_CONFIRMADAS_FILE.new"
     if ! jq -nr --slurpfile previous "$previous_file" --slurpfile current "$current_file" '
         ($previous[0] | map(.number | floor)) as $previous_numbers
         | ($current[0] | map(.number | floor)) as $current_numbers
         | (($previous_numbers - $current_numbers) | .[]? | tostring)
-    ' >"$output_file"; then
-        fail 'no se pudo identificar las PRs que salieron del inventario.'
+    ' >"$new_file"; then
+        fail 'no se pudo identificar las PRs salientes del inventario.'
+        return 1
+    fi
+    merge_salientes_confirmadas "$new_file"
+}
+
+merge_salientes_confirmadas() {
+    local new_numbers_file="$1" merged_file="$SALIENTES_CONFIRMADAS_FILE.merged"
+    if ! sort -n -u "$SALIENTES_CONFIRMADAS_FILE" "$new_numbers_file" >"$merged_file"; then
+        fail 'no se pudo acumular el conjunto de salientes confirmadas.'
+        return 1
+    fi
+    if ! mv "$merged_file" "$SALIENTES_CONFIRMADAS_FILE"; then
+        fail 'no se pudo conservar el conjunto acumulado de salientes confirmadas.'
         return 1
     fi
 }
 
-accumulate_removed_numbers() {
-    local previous_snapshot="$1" current_snapshot="$2" output_file="$3" new_file merged_file
-    new_file="$output_file.new"
-    merged_file="$output_file.merged"
-    if ! removed_pr_numbers "$previous_snapshot" "$current_snapshot" "$new_file"; then
+add_saliente_confirmada() {
+    local number="$1" new_file="$SALIENTES_CONFIRMADAS_FILE.new"
+    if ! printf '%s\n' "$number" >"$new_file"; then
+        fail "no se pudo acumular la PR #$number como saliente confirmada."
         return 1
     fi
-    if ! { cat "$output_file"; cat "$new_file"; } | sort -n -u >"$merged_file"; then
-        fail 'no se pudo acumular el conjunto de PRs salientes.'
-        return 1
-    fi
-    if ! mv "$merged_file" "$output_file"; then
-        fail 'no se pudo conservar el conjunto acumulado de PRs salientes.'
-        return 1
-    fi
+    merge_salientes_confirmadas "$new_file"
 }
 
 read_comments() {
@@ -253,30 +269,8 @@ read_comments() {
         return 1
     fi
     if ! jq -s 'if length == 0 then [] else add end' "$raw_file" >"$output_file"; then
-        if ! awk '
-            NR == 1 { pending = $0; next }
-            {
-                if (pending == "[]") {
-                    pending = $0
-                } else if ($0 == "[]") {
-                    next
-                } else if (pending ~ /]$/ && $0 ~ /^\[/) {
-                    sub(/]$/, "", pending)
-                    sub(/^\[/, "", $0)
-                    pending = pending "," $0
-                } else {
-                    pending = pending "\\n" $0
-                }
-            }
-            END { if (pending != "") print pending }
-        ' "$raw_file" >"$output_file.repaired"; then
-            fail "los comentarios de la PR #$number no son JSON válido."
-            return 1
-        fi
-        if ! jq -e . "$output_file.repaired" >"$output_file"; then
-            fail "los comentarios de la PR #$number no son JSON válido."
-            return 1
-        fi
+        fail "los comentarios de la PR #$number no son JSON válido."
+        return 1
     fi
     if ! jq -e 'type == "array" and all(.[]; type == "object" and (.body | type) == "string")' "$output_file" >/dev/null; then
         fail "los comentarios de la PR #$number tienen una forma inesperada."
@@ -303,30 +297,26 @@ read_labels() {
 }
 
 collect_state() {
-    local prs_file="$1" state_dir="$2" number expected_sha detail_file detail_number detail_state detail_base detail_sha remote_lines remote_sha
-    local normalized_expected normalized_actual previous_removed_file="$REMOVED_NUMBERS_FILE"
+    local prs_file="$1" state_dir="$2" number expected_sha detail_file detail_number detail_state detail_base detail_sha remote_sha
+    local normalized_expected normalized_actual previous_salientes_file="$SALIENTES_CONFIRMADAS_FILE"
     SNAPSHOT_DRIFT=0
     mkdir -p "$state_dir"
     SNAPSHOT_STATE_DIR="$state_dir"
-    if [ -n "$previous_removed_file" ] && [ -f "$previous_removed_file" ]; then
-        if ! cp "$previous_removed_file" "$state_dir/removed.tsv"; then
-            fail 'no se pudo conservar el conjunto de PRs salientes.'
+    if [ -n "$previous_salientes_file" ] && [ -f "$previous_salientes_file" ]; then
+        if ! cp "$previous_salientes_file" "$state_dir/salientes-confirmadas.tsv"; then
+            fail 'no se pudo conservar el conjunto de salientes confirmadas.'
             return 1
         fi
     else
-        : >"$state_dir/removed.tsv"
+        : >"$state_dir/salientes-confirmadas.tsv"
     fi
-    REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
-    if ! remote_lines=$(git ls-remote --exit-code origin refs/heads/main 2>/dev/null); then
+    SALIENTES_CONFIRMADAS_FILE="$state_dir/salientes-confirmadas.tsv"
+    if ! remote_sha=$(origin_main_sha); then
         fail 'no se pudo confirmar main antes de mutar.'
         return 1
     fi
-    remote_lines="${remote_lines%%$'\n'*}"
-    remote_sha="${remote_lines%%$'\t'*}"
     if [ "$remote_sha" != "$MAIN_SHA" ]; then
-        SNAPSHOT_DRIFT=1
-        REVALIDATION_PRS="$prs_file"
-        collect_removed_state "$state_dir" || return 1
+        register_drift "$prs_file" "$state_dir" || return 1
         return 0
     fi
 
@@ -339,13 +329,10 @@ collect_state() {
     normalize_prs "$prs_file" "$normalized_expected" || return 1
     normalize_prs "$state_dir/revalidation.json" "$normalized_actual" || return 1
     if ! cmp -s "$normalized_expected" "$normalized_actual"; then
-        if ! accumulate_removed_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
+        if ! accumulate_salientes_confirmadas_from_inventory "$prs_file" "$state_dir/revalidation.json"; then
             return 1
         fi
-        REVALIDATION_PRS="$state_dir/revalidation.json"
-        REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
-        SNAPSHOT_DRIFT=1
-        collect_removed_state "$state_dir" || return 1
+        register_drift "$state_dir/revalidation.json" "$state_dir" || return 1
         return 0
     fi
 
@@ -366,13 +353,13 @@ collect_state() {
         detail_base=$(jq -r '.base.ref' "$detail_file")
         detail_sha=$(jq -r '.head.sha' "$detail_file")
         if [ "$detail_number" != "$number" ] || [ "$detail_state" != open ] || [ "$detail_base" != main ] || [ "$detail_sha" != "$expected_sha" ]; then
-            if ! accumulate_removed_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
-                return 1
+            # Un head distinto sigue siendo deriva inestable; solo acumula una salida con el detalle del head que se evaluó.
+            if [ "$detail_number" = "$number" ] && [ "$detail_sha" = "$expected_sha" ] && { [ "$detail_state" != open ] || [ "$detail_base" != main ]; }; then
+                if ! add_saliente_confirmada "$number"; then
+                    return 1
+                fi
             fi
-            REVALIDATION_PRS="$state_dir/revalidation.json"
-            REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
-            SNAPSHOT_DRIFT=1
-            collect_removed_state "$state_dir" || return 1
+            register_drift "$state_dir/revalidation.json" "$state_dir" || return 1
             return 0
         fi
     done < "$SNAPSHOT_INVENTORY"
@@ -382,22 +369,19 @@ collect_state() {
         read_labels "$number" "$state_dir/labels-$number.json" || return 1
         awk -F '\t' -v number="$number" '$1 == number { print }' "$SNAPSHOT_FINDINGS" >"$state_dir/findings-$number.tsv"
     done < "$SNAPSHOT_INVENTORY"
-    collect_removed_state "$state_dir" || return 1
+    collect_salientes_confirmadas "$state_dir" || return 1
 }
 
 count_own_comments() {
-    local comments_file="$1"
-    jq -r --arg marker "$MARKER" '[.[] | select((.body | contains($marker)) and (.user | type) == "object" and (.user.type // "") == "Bot" and (.id != null))] | length' "$comments_file"
+    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | length" "$1"
 }
 
 own_comment_id() {
-    local comments_file="$1"
-    jq -r --arg marker "$MARKER" '[.[] | select((.body | contains($marker)) and (.user | type) == "object" and (.user.type // "") == "Bot" and (.id != null))][0].id | tostring' "$comments_file"
+    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | .[0].id | tostring" "$1"
 }
 
 own_comment_body() {
-    local comments_file="$1"
-    jq -r --arg marker "$MARKER" '[.[] | select((.body | contains($marker)) and (.user | type) == "object" and (.user.type // "") == "Bot" and (.id != null))][0].body // empty' "$comments_file"
+    jq -r --arg marker "$MARKER" "$OWN_COMMENTS | .[0].body // empty" "$1"
 }
 
 has_label() {
@@ -448,19 +432,20 @@ build_comment() {
 mutation_count=0
 mutation_window_start=0
 last_mutation_error=''
-REMOVED_NUMBERS_FILE=''
+SALIENTES_CONFIRMADAS_FILE=''
 mutation_retry_allowed=1
+OWN_COMMENTS="[.[] | select((.body | contains(\$marker)) and (.user | type) == \"object\" and (.user.type // \"\") == \"Bot\" and (.id != null))]"
 
-collect_removed_state() {
+collect_salientes_confirmadas() {
     local state_dir="$1" number detail_file
-    [ -n "$REMOVED_NUMBERS_FILE" ] || return 0
-    [ -f "$REMOVED_NUMBERS_FILE" ] || return 0
+    [ -n "$SALIENTES_CONFIRMADAS_FILE" ] || return 0
+    [ -f "$SALIENTES_CONFIRMADAS_FILE" ] || return 0
     while IFS= read -r number; do
         [ -n "$number" ] || continue
-        detail_file="$state_dir/removed-detail-$number.json"
-        if ! gh api "repos/$REPOSITORY/pulls/$number" >"$detail_file" 2>"$tmp_dir/removed-detail-$number.err"; then
-            cat "$tmp_dir/removed-detail-$number.err" >&2
-            fail "no se pudo confirmar el estado de la PR #$number que salió del inventario."
+        detail_file="$state_dir/saliente-detail-$number.json"
+        if ! gh api "repos/$REPOSITORY/pulls/$number" >"$detail_file" 2>"$tmp_dir/saliente-detail-$number.err"; then
+            cat "$tmp_dir/saliente-detail-$number.err" >&2
+            fail "no se pudo confirmar el estado de la PR #$number saliente."
             return 1
         fi
         if ! jq -e --argjson number "$number" '
@@ -477,18 +462,16 @@ collect_removed_state() {
             fail "la PR #$number sigue elegible o tiene una relectura inválida; no se limpian sus marcas."
             return 1
         fi
-        read_comments "$number" "$state_dir/removed-comments-$number.json" || return 1
-        read_labels "$number" "$state_dir/removed-labels-$number.json" || return 1
-    done <"$REMOVED_NUMBERS_FILE"
+        read_comments "$number" "$state_dir/saliente-comments-$number.json" || return 1
+        read_labels "$number" "$state_dir/saliente-labels-$number.json" || return 1
+    done <"$SALIENTES_CONFIRMADAS_FILE"
 }
 
 wait_seconds() {
-    local requested="$1" effective
-    effective="$requested"
-    if [ -n "$TEST_WAIT" ]; then
-        effective="$TEST_WAIT"
+    local effective="${TEST_WAIT:-$1}"
+    if [ "$effective" -gt 0 ]; then
+        sleep "$effective"
     fi
-    [ "$effective" -gt 0 ] && sleep "$effective"
 }
 
 before_mutation() {
@@ -514,22 +497,7 @@ gh_mutation_once() {
     local rc
     before_mutation
     last_mutation_error="$tmp_dir/last-mutation.err"
-    if gh "$1" "${@:2}" --include >"$tmp_dir/last-mutation.out" 2>"$last_mutation_error"; then
-        return 0
-    else
-        rc=$?
-        cat "$last_mutation_error" >&2
-        return "$rc"
-    fi
-}
-
-gh_mutation_once_json() {
-    local json_file="$1"
-    shift
-    local rc
-    before_mutation
-    last_mutation_error="$tmp_dir/last-mutation.err"
-    if gh "$1" "${@:2}" --include --input "$json_file" >"$tmp_dir/last-mutation.out" 2>"$last_mutation_error"; then
+    if gh "$@" --include >"$tmp_dir/last-mutation.out" 2>"$last_mutation_error"; then
         return 0
     else
         rc=$?
@@ -568,11 +536,18 @@ retry_mutation() {
     return 1
 }
 
-post_comment() {
-    local number="$1" body="$2" comments_file="$3" json_file
-    json_file="$tmp_dir/comment-$number.json"
+write_comment_json() {
+    local number="$1" body="$2" json_file="$tmp_dir/comment-$1.json"
     if ! printf '%s' "$body" | jq -Rs '{body: .}' >"$json_file"; then
         fail "no se pudo serializar el comentario de la PR #$number."
+        return 1
+    fi
+    printf '%s\n' "$json_file"
+}
+
+post_comment() {
+    local number="$1" body="$2" comments_file="$3" json_file
+    if ! json_file=$(write_comment_json "$number" "$body"); then
         return 1
     fi
     retry_mutation post_comment_attempt "$number" "$body" "$comments_file" "$json_file"
@@ -580,7 +555,7 @@ post_comment() {
 
 post_comment_attempt() {
     local number="$1" body="$2" comments_file="$3" json_file="$4" count own_id own_body
-    if gh_mutation_once_json "$json_file" api --method POST "repos/$REPOSITORY/issues/$number/comments"; then
+    if gh_mutation_once api --method POST "repos/$REPOSITORY/issues/$number/comments" --input "$json_file"; then
         return 0
     fi
     if ! read_comments "$number" "$comments_file"; then
@@ -622,12 +597,10 @@ post_comment_attempt() {
 
 patch_comment() {
     local number="$1" comment_id="$2" body="$3" json_file
-    json_file="$tmp_dir/comment-$number.json"
-    if ! printf '%s' "$body" | jq -Rs '{body: .}' >"$json_file"; then
-        fail "no se pudo serializar el comentario de la PR #$number."
+    if ! json_file=$(write_comment_json "$number" "$body"); then
         return 1
     fi
-    retry_mutation gh_mutation_once_json "$json_file" api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id"
+    retry_mutation gh_mutation_once api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --input "$json_file"
 }
 
 add_label() {
@@ -636,7 +609,7 @@ add_label() {
         fail "no se pudo serializar la etiqueta de la PR #$number."
         return 1
     fi
-    retry_mutation gh_mutation_once_json "$json_file" api --method POST "repos/$REPOSITORY/issues/$number/labels"
+    retry_mutation gh_mutation_once api --method POST "repos/$REPOSITORY/issues/$number/labels" --input "$json_file"
 }
 
 remove_label() {
@@ -673,7 +646,10 @@ delete_comment_attempt() {
 reconcile_pr() {
     local number="$1" findings_file="$SNAPSHOT_STATE_DIR/findings-$1.tsv" comments_file="$SNAPSHOT_STATE_DIR/comments-$1.json" labels_file="$SNAPSHOT_STATE_DIR/labels-$1.json" own_count own_id own_body desired risk=0
     [ -s "$findings_file" ] && risk=1
-    own_count=$(count_own_comments "$comments_file")
+    if ! own_count=$(count_own_comments "$comments_file"); then
+        fail "no se pudo contar el comentario propio de la PR #$number."
+        return 1
+    fi
     if [ "$own_count" -gt 1 ]; then
         warning "la PR #$number tiene $own_count comentarios propios con el marcador; no se hace borrado masivo."
     fi
@@ -682,8 +658,14 @@ reconcile_pr() {
         if [ "$own_count" -eq 0 ]; then
             post_comment "$number" "$desired" "$comments_file" || return 1
         elif [ "$own_count" -eq 1 ]; then
-            own_id=$(own_comment_id "$comments_file")
-            own_body=$(own_comment_body "$comments_file")
+            if ! own_id=$(own_comment_id "$comments_file"); then
+                fail "no se pudo identificar el comentario propio de la PR #$number."
+                return 1
+            fi
+            if ! own_body=$(own_comment_body "$comments_file"); then
+                fail "no se pudo leer el comentario propio de la PR #$number."
+                return 1
+            fi
             if [ "$own_body" != "$desired" ]; then
                 patch_comment "$number" "$own_id" "$desired" || return 1
             fi
@@ -696,20 +678,23 @@ reconcile_pr() {
             remove_label "$number" || return 1
         fi
         if [ "$own_count" -eq 1 ]; then
-            own_id=$(own_comment_id "$comments_file")
+            if ! own_id=$(own_comment_id "$comments_file"); then
+                fail "no se pudo identificar el comentario propio de la PR #$number."
+                return 1
+            fi
             delete_comment "$number" "$own_id" || return 1
         fi
     fi
 }
 
-reconcile_removed_pr() {
-    local number="$1" comments_file="$SNAPSHOT_STATE_DIR/removed-comments-$1.json" labels_file="$SNAPSHOT_STATE_DIR/removed-labels-$1.json" own_count own_id
+reconcile_saliente_pr() {
+    local number="$1" comments_file="$SNAPSHOT_STATE_DIR/saliente-comments-$1.json" labels_file="$SNAPSHOT_STATE_DIR/saliente-labels-$1.json" own_count own_id
     if ! own_count=$(count_own_comments "$comments_file"); then
-        fail "no se pudo contar el comentario propio de la PR #$number que salió del inventario."
+        fail "no se pudo contar el comentario propio de la PR #$number saliente."
         return 1
     fi
     if [ "$own_count" -gt 1 ]; then
-        warning "la PR #$number que salió del inventario tiene $own_count comentarios propios; no se hace borrado masivo."
+        warning "la PR #$number saliente tiene $own_count comentarios propios; no se hace borrado masivo."
         return 0
     fi
     if has_label "$labels_file"; then
@@ -717,54 +702,36 @@ reconcile_removed_pr() {
     fi
     if [ "$own_count" -eq 1 ]; then
         if ! own_id=$(own_comment_id "$comments_file"); then
-            fail "no se pudo identificar el comentario propio de la PR #$number que salió del inventario."
+            fail "no se pudo identificar el comentario propio de la PR #$number saliente."
             return 1
         fi
         delete_comment "$number" "$own_id" || return 1
     fi
 }
 
-reconcile_removed_only() {
-    local number reconciled=0 failures=0
-    if [ -z "$REMOVED_NUMBERS_FILE" ] || [ ! -s "$REMOVED_NUMBERS_FILE" ]; then
-        return 0
-    fi
-    while IFS= read -r number; do
-        [ -n "$number" ] || continue
-        if reconcile_removed_pr "$number"; then
-            reconciled=$((reconciled + 1))
-        else
-            failures=$((failures + 1))
-            warning "no se pudo limpiar por completo la PR #$number que salió del inventario."
-        fi
-    done <"$REMOVED_NUMBERS_FILE"
-    if [ "$failures" -gt 0 ] && [ "$reconciled" -eq 0 ]; then
-        return 2
-    fi
-    return 0
-}
-
-reconcile_all() {
-    local number _sha reconciled=0 failures=0
-    while IFS=$'\t' read -r number _sha; do
-        [ -n "$number" ] || continue
-        if reconcile_pr "$number"; then
-            reconciled=$((reconciled + 1))
-        else
-            failures=$((failures + 1))
-            warning "no se pudo reconciliar por completo la PR #$number; se conserva cualquier estado parcial."
-        fi
-    done < "$SNAPSHOT_INVENTORY"
-    if [ -n "$REMOVED_NUMBERS_FILE" ] && [ -f "$REMOVED_NUMBERS_FILE" ]; then
-        while IFS= read -r number; do
+reconcile_prs() {
+    local include_current="$1" number _sha reconciled=0 failures=0
+    if [ "$include_current" -eq 1 ]; then
+        while IFS=$'\t' read -r number _sha; do
             [ -n "$number" ] || continue
-            if reconcile_removed_pr "$number"; then
+            if reconcile_pr "$number"; then
                 reconciled=$((reconciled + 1))
             else
                 failures=$((failures + 1))
-                warning "no se pudo limpiar por completo la PR #$number que salió del inventario."
+                warning "no se pudo reconciliar por completo la PR #$number; se conserva cualquier estado parcial."
             fi
-        done <"$REMOVED_NUMBERS_FILE"
+        done < "$SNAPSHOT_INVENTORY"
+    fi
+    if [ -n "$SALIENTES_CONFIRMADAS_FILE" ] && [ -f "$SALIENTES_CONFIRMADAS_FILE" ]; then
+        while IFS= read -r number; do
+            [ -n "$number" ] || continue
+            if reconcile_saliente_pr "$number"; then
+                reconciled=$((reconciled + 1))
+            else
+                failures=$((failures + 1))
+                warning "no se pudo limpiar por completo la PR #$number saliente."
+            fi
+        done <"$SALIENTES_CONFIRMADAS_FILE"
     fi
     if [ "$failures" -gt 0 ] && [ "$reconciled" -eq 0 ]; then
         return 2
@@ -796,7 +763,7 @@ main() {
         if ! preflight_label; then
             return 2
         fi
-        if [ "$SNAPSHOT_COUNT" -eq 0 ] && { [ -z "$REMOVED_NUMBERS_FILE" ] || [ ! -s "$REMOVED_NUMBERS_FILE" ]; }; then
+        if [ "$SNAPSHOT_COUNT" -eq 0 ] && { [ -z "$SALIENTES_CONFIRMADAS_FILE" ] || [ ! -s "$SALIENTES_CONFIRMADAS_FILE" ]; }; then
             printf 'marcar-prs-en-riesgo: cero PRs abiertas elegibles; no se escribe.\n'
             return 0
         fi
@@ -811,10 +778,10 @@ main() {
                 continue
             fi
             warning 'el snapshot derivó por segunda vez; se conservan las marcas de las PRs vigentes y no se escribe sobre ellas.'
-            reconcile_removed_only
+            reconcile_prs 0
             return $?
         fi
-        reconcile_all
+        reconcile_prs 1
         return $?
     done
     return 0
