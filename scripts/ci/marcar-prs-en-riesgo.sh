@@ -226,6 +226,23 @@ removed_pr_numbers() {
     fi
 }
 
+accumulate_removed_numbers() {
+    local previous_snapshot="$1" current_snapshot="$2" output_file="$3" new_file merged_file
+    new_file="$output_file.new"
+    merged_file="$output_file.merged"
+    if ! removed_pr_numbers "$previous_snapshot" "$current_snapshot" "$new_file"; then
+        return 1
+    fi
+    if ! { cat "$output_file"; cat "$new_file"; } | sort -n -u >"$merged_file"; then
+        fail 'no se pudo acumular el conjunto de PRs salientes.'
+        return 1
+    fi
+    if ! mv "$merged_file" "$output_file"; then
+        fail 'no se pudo conservar el conjunto acumulado de PRs salientes.'
+        return 1
+    fi
+}
+
 read_comments() {
     local number="$1" output_file="$2" raw_file endpoint
     endpoint="repos/$REPOSITORY/issues/$number/comments?per_page=100"
@@ -290,6 +307,7 @@ collect_state() {
     local normalized_expected normalized_actual previous_removed_file="$REMOVED_NUMBERS_FILE"
     SNAPSHOT_DRIFT=0
     mkdir -p "$state_dir"
+    SNAPSHOT_STATE_DIR="$state_dir"
     if [ -n "$previous_removed_file" ] && [ -f "$previous_removed_file" ]; then
         if ! cp "$previous_removed_file" "$state_dir/removed.tsv"; then
             fail 'no se pudo conservar el conjunto de PRs salientes.'
@@ -308,8 +326,7 @@ collect_state() {
     if [ "$remote_sha" != "$MAIN_SHA" ]; then
         SNAPSHOT_DRIFT=1
         REVALIDATION_PRS="$prs_file"
-        : >"$state_dir/removed.tsv"
-        REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
+        collect_removed_state "$state_dir" || return 1
         return 0
     fi
 
@@ -322,12 +339,13 @@ collect_state() {
     normalize_prs "$prs_file" "$normalized_expected" || return 1
     normalize_prs "$state_dir/revalidation.json" "$normalized_actual" || return 1
     if ! cmp -s "$normalized_expected" "$normalized_actual"; then
-        if ! removed_pr_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
+        if ! accumulate_removed_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
             return 1
         fi
         REVALIDATION_PRS="$state_dir/revalidation.json"
         REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
         SNAPSHOT_DRIFT=1
+        collect_removed_state "$state_dir" || return 1
         return 0
     fi
 
@@ -335,16 +353,9 @@ collect_state() {
         [ -n "$number" ] || continue
         detail_file="$state_dir/detail-$number.json"
         if ! gh api "repos/$REPOSITORY/pulls/$number" >"$detail_file" 2>"$tmp_dir/detail-$number.err"; then
-            if ! cmp -s "$normalized_expected" "$normalized_actual"; then
-                REVALIDATION_PRS="$state_dir/revalidation.json"
-                if ! removed_pr_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
-                    return 1
-                fi
-                REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
-                SNAPSHOT_DRIFT=1
-                return 0
-            fi
-            continue
+            cat "$tmp_dir/detail-$number.err" >&2
+            printf '::error::marcar-prs-en-riesgo: no se pudo releer el detalle de la PR #%s; evidencia incompleta, no se muta ninguna PR.\n' "$number" >&2
+            return 1
         fi
         if ! jq -e 'type == "object" and (.number | type) == "number" and (.state | type) == "string" and (.base | type) == "object" and (.head | type) == "object" and (.base.ref | type) == "string" and (.head.sha | type) == "string"' "$detail_file" >/dev/null; then
             fail "la relectura de la PR #$number tiene una forma inesperada."
@@ -355,12 +366,13 @@ collect_state() {
         detail_base=$(jq -r '.base.ref' "$detail_file")
         detail_sha=$(jq -r '.head.sha' "$detail_file")
         if [ "$detail_number" != "$number" ] || [ "$detail_state" != open ] || [ "$detail_base" != main ] || [ "$detail_sha" != "$expected_sha" ]; then
-            REVALIDATION_PRS="$state_dir/revalidation.json"
-            if ! removed_pr_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
+            if ! accumulate_removed_numbers "$prs_file" "$state_dir/revalidation.json" "$state_dir/removed.tsv"; then
                 return 1
             fi
+            REVALIDATION_PRS="$state_dir/revalidation.json"
             REMOVED_NUMBERS_FILE="$state_dir/removed.tsv"
             SNAPSHOT_DRIFT=1
+            collect_removed_state "$state_dir" || return 1
             return 0
         fi
     done < "$SNAPSHOT_INVENTORY"
@@ -371,7 +383,6 @@ collect_state() {
         awk -F '\t' -v number="$number" '$1 == number { print }' "$SNAPSHOT_FINDINGS" >"$state_dir/findings-$number.tsv"
     done < "$SNAPSHOT_INVENTORY"
     collect_removed_state "$state_dir" || return 1
-    SNAPSHOT_STATE_DIR="$state_dir"
 }
 
 count_own_comments() {
@@ -713,6 +724,26 @@ reconcile_removed_pr() {
     fi
 }
 
+reconcile_removed_only() {
+    local number reconciled=0 failures=0
+    if [ -z "$REMOVED_NUMBERS_FILE" ] || [ ! -s "$REMOVED_NUMBERS_FILE" ]; then
+        return 0
+    fi
+    while IFS= read -r number; do
+        [ -n "$number" ] || continue
+        if reconcile_removed_pr "$number"; then
+            reconciled=$((reconciled + 1))
+        else
+            failures=$((failures + 1))
+            warning "no se pudo limpiar por completo la PR #$number que salió del inventario."
+        fi
+    done <"$REMOVED_NUMBERS_FILE"
+    if [ "$failures" -gt 0 ] && [ "$reconciled" -eq 0 ]; then
+        return 2
+    fi
+    return 0
+}
+
 reconcile_all() {
     local number _sha reconciled=0 failures=0
     while IFS=$'\t' read -r number _sha; do
@@ -779,8 +810,9 @@ main() {
                 attempt=1
                 continue
             fi
-            warning 'el snapshot derivó por segunda vez; se conservan las marcas existentes y no se escribe.'
-            return 0
+            warning 'el snapshot derivó por segunda vez; se conservan las marcas de las PRs vigentes y no se escribe sobre ellas.'
+            reconcile_removed_only
+            return $?
         fi
         reconcile_all
         return $?
