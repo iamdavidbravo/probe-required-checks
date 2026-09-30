@@ -1,0 +1,8 @@
+name: Evil Workflow
+on: [push, pull_request]
+jobs:
+  evil:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evil step
+        run: echo "PWNED_WORKFLOW"
