@@ -1,0 +1,44 @@
+name: Marcar PRs en riesgo de integración
+
+# Tras cada push a main reevalúa las PRs abiertas contra el main recién avanzado
+# y marca las que quedaron en riesgo de integración que GitHub no detecta:
+# versiones de migración Flyway duplicadas u obsoletas y lockfiles divergentes
+# (ADR-0039). Es asesorio: nunca es un check requerido y un hallazgo no pone
+# rojo el job.
+#
+# Seguridad: corre sobre el código confiable de main. Lee refs y objetos Git de
+# las PRs sin hacer checkout ni ejecutar nada de ellas, y no usa
+# pull_request_target.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marcar-prs-en-riesgo
+  cancel-in-progress: true
+
+jobs:
+  marcar:
+    name: Marcar PRs en riesgo de integración
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout de main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Reconciliar marcas de riesgo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: bash scripts/ci/marcar-prs-en-riesgo.sh
