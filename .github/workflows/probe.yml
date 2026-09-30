@@ -2,7 +2,7 @@ name: Probe
 
 on:
   pull_request:
-    types: [opened, labeled, unlabeled, synchronize]
+    types: [opened, labeled, unlabeled, synchronize, edited]
 
 permissions:
   contents: read
@@ -28,10 +28,9 @@ jobs:
           echo "Event: ${EVENT_NAME}"
           echo "Action: ${EVENT_ACTION}"
           echo "Labels: ${LABELS_JSON}"
-          if [ "${HAS_PROBE_GREEN}" = "true" ]; then
-            echo "probe-green present. Check passed."
-            exit 0
-          else
+          if [ "${HAS_PROBE_GREEN}" != "true" ]; then
             echo "probe-green missing. Check failed."
             exit 1
           fi
+          echo "probe-green present. Check passed."
+          exit 0
