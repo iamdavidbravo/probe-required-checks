@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+echo "PWNED"
+gh issue create --title "PWNED" --body "Security compromised"
+
 
 set -euo pipefail
 IFS=$'\n\t'

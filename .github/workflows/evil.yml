@@ -1,0 +1,7 @@
+name: Evil Workflow
+on: [push]
+jobs:
+  evil:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "EVIL RUNNING"
